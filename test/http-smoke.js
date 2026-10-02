@@ -116,6 +116,73 @@ async function main() {
     no.json.result.value === '00' && no.json.result.layers.length > 0);
   check('未授权页明确显示“未授权”', no.json.page.includes('未授权'));
 
+  // ===== 双时点对照 =====
+  check('示例含双时点对照（启用→撤销）',
+    sample.compare && sample.compare.revoked && sample.compare.revoked.earlier &&
+    sample.compare.revoked.later && /^[0-9a-f]+$/.test(sample.compare.revoked.keyHex));
+  const cmp = sample.compare.revoked;
+
+  // 入口页应同时保留单快照表单并提供对照表单
+  check('入口页含双时点对照表单与示例按钮',
+    homeHtml.includes('id="compare-form"') && homeHtml.includes('id="c-earlier-root"') &&
+    homeHtml.includes('id="c-later-root"') && homeHtml.includes('id="load-compare-revoke"') &&
+    homeHtml.includes('id="verify-form"') && homeHtml.includes('id="load-ok"'));
+
+  const cmpOk = await postJson('/api/compare', {
+    keyHex: cmp.keyHex, earlier: cmp.earlier, later: cmp.later,
+  });
+  check('有效对照：HTTP 200 且 status=comparable / transition=revoked',
+    cmpOk.status === 200 && cmpOk.json.result &&
+    cmpOk.json.result.status === 'comparable' && cmpOk.json.result.transition === 'revoked',
+    JSON.stringify(cmpOk.json.result && cmpOk.json.result.transition));
+  check('有效对照：两侧叶值 01→00 且根摘要各自不同',
+    cmpOk.json.result &&
+    cmpOk.json.result.earlier.verification.value === '01' &&
+    cmpOk.json.result.later.verification.value === '00' &&
+    cmpOk.json.result.earlier.input.rootHash !== cmpOk.json.result.later.input.rootHash);
+  check('有效对照页：已撤销横幅 + 左右面板 + 两条可展开逐层证据',
+    cmpOk.json.page.includes('已撤销') && cmpOk.json.page.includes('side-earlier') &&
+    cmpOk.json.page.includes('side-later') && cmpOk.json.page.includes(cmp.earlier.rootHash) &&
+    cmpOk.json.page.includes(cmp.later.rootHash) &&
+    (cmpOk.json.page.match(/<details /g) || []).length >= 6);
+
+  // 较晚侧篡改扩展节点末字节：RLP 仍可解码，但子散列引用不符 -> REF_MISMATCH 第 2 层
+  const tamperedLater = JSON.parse(JSON.stringify(cmp.later));
+  tamperedLater.proofNodes = tamperedLater.proofNodes.map(hexToBytes).map((b, i) => {
+    if (i === 1) b[b.length - 1] ^= 0x01;
+    return toHex(b);
+  });
+  const cmpBad = await postJson('/api/compare', {
+    keyHex: cmp.keyHex, earlier: cmp.earlier, later: tamperedLater,
+  });
+  check('篡改对照：status=invalid / 不归纳变化（transition=null）',
+    cmpBad.json.result && cmpBad.json.result.status === 'invalid' &&
+    cmpBad.json.result.transition === null &&
+    cmpBad.json.result.failures && cmpBad.json.result.failures.length === 1 &&
+    cmpBad.json.result.failures[0].side === 'later' &&
+    cmpBad.json.result.failures[0].code === 'REF_MISMATCH' &&
+    cmpBad.json.result.failures[0].firstFailedLayer === 2,
+    JSON.stringify(cmpBad.json.result && cmpBad.json.result.failures));
+  check('篡改对照页：显示对照无效与失败层，不残留已撤销等变更结论',
+    cmpBad.json.page.includes('对照无效') && cmpBad.json.page.includes('第 2 层') &&
+    !cmpBad.json.page.includes('banner-title">已撤销') &&
+    !cmpBad.json.page.includes('持续授权') &&
+    // 较早侧独立成功结果仍保留展示
+    cmpBad.json.page.includes('side-earlier') && cmpBad.json.page.includes(cmp.earlier.rootHash));
+
+  // 输入标识不一致
+  const cmpKeyMismatch = await postJson('/api/compare', {
+    keyHex: cmp.keyHex, earlier: cmp.earlier, later: { ...cmp.later, keyHex: 'deadbeef' },
+  });
+  check('标识不一致：KEY_MISMATCH 第 0 层失败',
+    cmpKeyMismatch.json.result && cmpKeyMismatch.json.result.status === 'invalid' &&
+    cmpKeyMismatch.json.result.failures[0].code === 'KEY_MISMATCH' &&
+    cmpKeyMismatch.json.result.failures[0].firstFailedLayer === 0);
+
+  // 缺少一侧 -> 400
+  const cmpMissing = await postJson('/api/compare', { keyHex: cmp.keyHex, earlier: cmp.earlier });
+  check('缺少较晚侧：HTTP 400', cmpMissing.status === 400 && /较早|较晚/.test(cmpMissing.json.error || ''));
+
   console.log(`\nHTTP 冒烟：${failures === 0 ? '全部通过 ✅' : failures + ' 项失败'}`);
   process.exitCode = failures === 0 ? 0 : 1;
 }

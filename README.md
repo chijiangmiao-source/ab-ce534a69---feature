@@ -49,6 +49,34 @@ WEB_PORT=9090 docker compose up web
 健康检查：`GET /healthz` 返回 `200 {"status":"ok",...}`。入口页提供
 “载入示例：已授权 / 未授权”按钮，可直接观察三类复核结论。
 
+## 双时点快照对照
+
+同一入口页下半部分提供**双时点快照对照**表单：审查员为**同一条十六进制指令**
+分别录入**较早快照**与**较晚快照**的 32 字节根哈希与根到叶 RLP 节点，一次提交
+（`POST /api/compare`）。
+
+系统对两侧证明**各自独立核验**（复用同一套 MPT 核验内核）：
+
+- **仅当两侧都完整有效**时，才按各自叶值归纳：
+
+  | 较早叶值 | 较晚叶值 | 对照结论 |
+  |---|---|---|
+  | `01` | `01` | 持续授权 |
+  | `01` | 非 `01` | **已撤销** |
+  | 非 `01` | `01` | 已启用 |
+  | 非 `01` | 非 `01` | 持续未授权 |
+
+- 结果页以左右两栏清楚区分两侧的**根摘要、叶值与授权状态**，并各保留一条
+  **可逐层展开（`<details>`）的路径证据**。
+- 任一侧出现引用不符（`REF_MISMATCH`/`ROOT_MISMATCH`）、非规范 RLP
+  （`RLP_NONCANONICAL`）、路径残缺（`PATH_INCOMPLETE` 等）或**输入标识不一致**
+  （`KEY_MISMATCH`，两侧指令标识不是同一条 hex），对照结论一律为**“对照无效”**，
+  逐条标明失败侧及其**首个失败层**；另一侧即使核验成功，也**绝不据其推断本侧的
+  状态变化**，且不残留任何旧的变更结论。
+
+`GET /api/sample` 在 `compare.revoked` 下提供一组“启用 → 撤销”的两快照示例，
+入口页“载入对照示例：启用 → 撤销”按钮可直接观察完整变更证据。
+
 ### 验收服务 `verify`
 
 Compose 提供名为 **`verify`** 的一次性服务：等待 `web` 健康后，在
@@ -69,7 +97,7 @@ docker compose rm -f verify 2>/dev/null; docker compose run --build verify; echo
 要求 Node.js ≥ 20，全程零依赖：
 
 ```bash
-npm test                 # 进程内内核 + 页面 + 临时 HTTP 冒烟（45 项）
+npm test                 # 进程内内核 + 页面 + 临时 HTTP 冒烟（63 项）
 PORT=8123 npm start      # 启动服务
 BASE_URL=http://127.0.0.1:8123 node test/http-smoke.js
 ```
@@ -86,7 +114,8 @@ src/
   verifier.js        证明核验内核：逐层回放 + 首个失败层定位
   page.js            结果页/入口页 HTML 构建（可在无 DOM 下单测）
   verify-api.js      /api/verify 输入解析与结果组装
-  sample-snapshot.js 内置离线示例快照
+  compare-api.js     /api/compare 双时点对照：两侧独立核验与状态变化归纳
+  sample-snapshot.js 内置离线示例快照（单快照与双时点对照各一组）
   server.js          零依赖 HTTP 服务（/、/healthz、/api/verify、/api/sample）
 test/
   harness.js         零依赖测试框架
