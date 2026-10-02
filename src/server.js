@@ -1,13 +1,17 @@
 'use strict';
 // 零依赖 HTTP 服务：
-//   GET  /            静态导入入口页
-//   GET  /healthz     健康检查 -> 200 {"status":"ok"}
-//   POST /api/verify  证明核验（JSON 入参，返回 {result, page}）
+//   GET  /                    静态导入入口页（单快照复核 + 双时点对照）
+//   GET  /healthz             健康检查 -> 200 {"status":"ok"}
+//   POST /api/verify          单快照证明核验（JSON 入参，返回 {result, page}）
+//   POST /api/compare         双时点对照核验（JSON 入参，返回 {result, page}）
+//   GET  /api/sample          单快照示例
+//   GET  /api/sample/compare  双时点对照示例（已启用 → 已撤销）
 // 宿主端口可经环境变量 PORT / HOST 配置。
 const http = require('node:http');
 const { handleVerify } = require('./verify-api');
+const { handleCompare } = require('./compare-api');
 const { buildIndexPage } = require('./page');
-const { buildSnapshots } = require('./sample-snapshot');
+const { buildSnapshots, buildCompareSnapshots } = require('./sample-snapshot');
 const { toHex } = require('./hexutil');
 
 function samplePayload() {
@@ -23,6 +27,20 @@ function samplePayload() {
       authorized: make(snap.keys.authorized),
       unauthorized: make(snap.keys.unauthorized),
     },
+  };
+}
+
+function sampleComparePayload() {
+  const cmp = buildCompareSnapshots();
+  const side = (s) => ({
+    rootHash: s.rootHashHex,
+    keyHex: cmp.keyHex,
+    proofNodes: s.proof.map((p) => toHex(p)),
+  });
+  return {
+    keyHex: cmp.keyHex,
+    earlier: side(cmp.earlier),
+    later: side(cmp.later),
   };
 }
 
@@ -43,6 +61,30 @@ function sendHtml(res, status, html) {
   res.end(html);
 }
 
+// 读取并解析 JSON 请求体（2 MiB 上限），然后交给 handler。
+function readJsonBody(req, res, handler) {
+  const chunks = [];
+  let size = 0;
+  req.on('data', (c) => {
+    size += c.length;
+    if (size > 2 * 1024 * 1024) {
+      sendJson(res, 413, { error: '请求体超过 2 MiB 限制' });
+      req.destroy();
+      return;
+    }
+    chunks.push(c);
+  });
+  req.on('end', () => {
+    let body;
+    try {
+      body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+    } catch (e) {
+      return sendJson(res, 400, { error: `JSON 请求体解析失败：${e.message}` });
+    }
+    handler(body);
+  });
+}
+
 function createServer() {
   const indexHtml = buildIndexPage();
 
@@ -61,30 +103,24 @@ function createServer() {
       return sendJson(res, 200, samplePayload());
     }
 
+    if (req.method === 'GET' && url.pathname === '/api/sample/compare') {
+      return sendJson(res, 200, sampleComparePayload());
+    }
+
     if (req.method === 'POST' && url.pathname === '/api/verify') {
-      const chunks = [];
-      let size = 0;
-      req.on('data', (c) => {
-        size += c.length;
-        if (size > 2 * 1024 * 1024) {
-          sendJson(res, 413, { error: '请求体超过 2 MiB 限制' });
-          req.destroy();
-          return;
-        }
-        chunks.push(c);
-      });
-      req.on('end', () => {
-        let body;
-        try {
-          body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
-        } catch (e) {
-          return sendJson(res, 400, { error: `JSON 请求体解析失败：${e.message}` });
-        }
+      return readJsonBody(req, res, (body) => {
         const out = handleVerify(body);
         if (out.error) return sendJson(res, out.httpStatus, { error: out.error });
         sendJson(res, 200, { result: out.result, page: out.page });
       });
-      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/compare') {
+      return readJsonBody(req, res, (body) => {
+        const out = handleCompare(body);
+        if (out.error) return sendJson(res, out.httpStatus, { error: out.error });
+        sendJson(res, 200, { result: out.result, page: out.page });
+      });
     }
 
     sendJson(res, 404, { error: '未找到该路径' });

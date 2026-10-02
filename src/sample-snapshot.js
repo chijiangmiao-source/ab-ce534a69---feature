@@ -38,4 +38,33 @@ function buildSnapshots() {
   };
 }
 
-module.exports = { buildSnapshots };
+// 双时点对照示例：同一指令在较早快照中为启用（01）、在较晚快照中被撤销（00）。
+// 两棵树的背景键集合一致（MPT 规范结构与插入顺序无关），仅目标键叶值不同，
+// 因此两个根哈希不同、两侧证明各自独立有效。
+function buildCompareSnapshots() {
+  const keyHex = '0123456789abcdef0123';
+  const keyNibbles = bytesToNibbles(Buffer.from(keyHex, 'hex'));
+
+  const build = (targetValue) => {
+    const trie = new Trie();
+    const put = (k, ...value) => trie.put(bytesToNibbles(Buffer.from(k, 'hex')), Uint8Array.of(...value));
+    put('0123456789abcdef0124', 0x00);
+    put('0123456789abcdef0abc', 0x01);
+    put('0123456789abdddddddd', 0x02);
+    put('fedcba9876543210abcd', 0x01);
+    put('fedcba9876543210abce', 0x01);
+    put('a1', 0x00);
+    put('a2', 0x01);
+    put(keyHex, targetValue); // 目标指令：较早 01（已启用），较晚 00（已撤销）
+    const rootHash = trie.commit();
+    return { rootHash, rootHashHex: toHex(rootHash), proof: trie.proveKey(keyNibbles) };
+  };
+
+  return {
+    keyHex,
+    earlier: build(0x01),
+    later: build(0x00),
+  };
+}
+
+module.exports = { buildSnapshots, buildCompareSnapshots };

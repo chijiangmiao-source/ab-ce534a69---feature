@@ -1,6 +1,7 @@
 'use strict';
 // 对运行中的 web 服务执行端到端 HTTP 冒烟：
 //   健康端点 / 静态入口页 / 示例快照 / 有效授权 / 篡改子节点引用 / 非规范 RLP
+//   / 双时点对照（启用→撤销、一侧篡改、标识不一致）
 // 用法：BASE_URL=http://web:8080 node test/http-smoke.js
 // 任一检查失败即以非零退出码结束。
 const BASE = process.env.BASE_URL || 'http://127.0.0.1:8080';
@@ -65,6 +66,9 @@ async function main() {
   check('入口页含三要素表单与静态入口标题',
     homeHtml.includes('name="rootHash"') && homeHtml.includes('name="keyHex"') &&
     homeHtml.includes('name="proofNodes"') && homeHtml.includes('离线指令授权快照复核'));
+  check('入口页含双时点对照表单',
+    homeHtml.includes('id="compare-form"') && homeHtml.includes('id="cmp-root-earlier"') &&
+    homeHtml.includes('id="cmp-root-later"') && homeHtml.includes('id="load-compare"'));
 
   const sampleRes = await fetch(BASE + '/api/sample');
   check('GET /api/sample 返回 200', sampleRes.status === 200);
@@ -115,6 +119,52 @@ async function main() {
     no.json.result && no.json.result.status === 'unauthorized' &&
     no.json.result.value === '00' && no.json.result.layers.length > 0);
   check('未授权页明确显示“未授权”', no.json.page.includes('未授权'));
+
+  // 场景四：双时点对照（已启用 → 已撤销）
+  const cmpSampleRes = await fetch(BASE + '/api/sample/compare');
+  check('GET /api/sample/compare 返回 200', cmpSampleRes.status === 200);
+  const cmpSample = await cmpSampleRes.json();
+  check('对照示例含较早/较晚两套输入且指令标识一致、根哈希不同',
+    !!cmpSample.earlier && !!cmpSample.later &&
+    cmpSample.earlier.keyHex === cmpSample.later.keyHex &&
+    cmpSample.earlier.rootHash !== cmpSample.later.rootHash);
+
+  const cmpOk = await postJson('/api/compare', { earlier: cmpSample.earlier, later: cmpSample.later });
+  check('对照（启用→撤销）：HTTP 200 且结论 revoked',
+    cmpOk.status === 200 && cmpOk.json.result &&
+    cmpOk.json.result.status === 'compared' && cmpOk.json.result.conclusion === 'revoked',
+    JSON.stringify(cmpOk.json.result && cmpOk.json.result.conclusion));
+  check('对照页显示“已撤销”，双栏区分两侧并保留两条可展开逐层路径证据',
+    cmpOk.json.page.includes('已撤销') &&
+    cmpOk.json.page.includes('较早快照') && cmpOk.json.page.includes('较晚快照') &&
+    cmpOk.json.page.includes(cmpSample.earlier.rootHash) &&
+    cmpOk.json.page.includes(cmpSample.later.rootHash) &&
+    (cmpOk.json.page.match(/<details class="layers">/g) || []).length === 2);
+
+  // 一侧篡改：较晚侧第 2 个证明节点末字节翻转 -> 只显示无效对照，不残留变更结论
+  const cmpTampered = { earlier: cmpSample.earlier, later: JSON.parse(JSON.stringify(cmpSample.later)) };
+  const cnodes = cmpTampered.later.proofNodes.map(hexToBytes);
+  cnodes[1][cnodes[1].length - 1] ^= 0x01;
+  cmpTampered.later.proofNodes = cnodes.map((b) => toHex(b));
+  const cmpBad = await postJson('/api/compare', cmpTampered);
+  check('对照一侧篡改：status=invalid 且定位较晚侧首个失败层（第 2 层）',
+    cmpBad.json.result && cmpBad.json.result.status === 'invalid' &&
+    /较晚快照首个失败层：第 2 层/.test(cmpBad.json.result.reason || ''),
+    JSON.stringify(cmpBad.json.result && cmpBad.json.result.reason));
+  check('篡改对照页只显示无效对照、不残留变更结论',
+    cmpBad.json.page.includes('对照无效') &&
+    !cmpBad.json.page.includes('banner-title">已撤销') &&
+    !cmpBad.json.page.includes('banner-title">已启用'));
+
+  // 输入标识不一致：两侧指令标识不同 -> KEY_MISMATCH
+  const cmpKeyBad = await postJson('/api/compare', {
+    earlier: cmpSample.earlier,
+    later: Object.assign({}, cmpSample.later, { keyHex: 'a2' }),
+  });
+  check('对照标识不一致：status=invalid / KEY_MISMATCH',
+    cmpKeyBad.json.result && cmpKeyBad.json.result.status === 'invalid' &&
+    cmpKeyBad.json.result.code === 'KEY_MISMATCH',
+    JSON.stringify(cmpKeyBad.json.result && cmpKeyBad.json.result.code));
 
   console.log(`\nHTTP 冒烟：${failures === 0 ? '全部通过 ✅' : failures + ' 项失败'}`);
   process.exitCode = failures === 0 ? 0 : 1;

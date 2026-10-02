@@ -368,6 +368,255 @@ async function main() {
     });
   });
 
+  // ========== 场景四：双时点对照 ==========
+  await suite('场景四：双时点对照（启用→撤销 / 一侧篡改 / 标识不一致）').run(async () => {
+    const { handleCompare } = require('../src/compare-api');
+    const { buildCompareSnapshots } = require('../src/sample-snapshot');
+    const { buildComparePage } = require('../src/page');
+
+    const cmpSnap = buildCompareSnapshots();
+    const sidePayload = (s) => ({
+      rootHash: s.rootHashHex,
+      keyHex: cmpSnap.keyHex,
+      proofNodes: s.proof.map((p) => toHex(p)),
+    });
+    const validBody = () => ({ earlier: sidePayload(cmpSnap.earlier), later: sidePayload(cmpSnap.later) });
+    const tamperSide = (side) => {
+      const nodes = side.proofNodes.map((h) => Uint8Array.from(fromHex(h)));
+      nodes[1][nodes[1].length - 1] ^= 0x01; // 翻转第 2 个证明节点末字节，保持 RLP 可解码
+      side.proofNodes = nodes.map((n) => toHex(n));
+      return side;
+    };
+    // 与场景三相同的非规范内嵌叶（c4 20 8101）根分支，键 02 可达。
+    const noncanonNode = () => {
+      const slots = [];
+      for (let i = 0; i < 17; i++) slots.push(B(i === 2 ? 'c4208101' : '80'));
+      const payload = concatRaw(slots);
+      return Buffer.concat([Buffer.from(rlpLenPrefix(payload.length, 0xc0)), payload]);
+    };
+    // 把规范列表节点改写为“前导零长度前缀”的非规范长形式（负载不变），
+    // 用于在不改动指令标识的前提下让较早侧触发 RLP_NONCANONICAL。
+    const noncanonRewrap = (nodeBytes) => {
+      const b = nodeBytes;
+      let headerLen;
+      let payloadLen;
+      if (b[0] <= 0xf7) {
+        headerLen = 1;
+        payloadLen = b[0] - 0xc0;
+      } else {
+        const ll = b[0] - 0xf7;
+        headerLen = 1 + ll;
+        payloadLen = 0;
+        for (let i = 0; i < ll; i++) payloadLen = payloadLen * 256 + b[1 + i];
+      }
+      const payload = b.subarray(headerLen, headerLen + payloadLen);
+      const lenBytes = [];
+      let x = payloadLen;
+      while (x > 0) {
+        lenBytes.push(x & 0xff);
+        x = Math.floor(x / 256);
+      }
+      lenBytes.reverse();
+      return concatRaw([Uint8Array.of(0xf7 + lenBytes.length + 1, 0x00, ...lenBytes), payload]);
+    };
+
+    test('对照API：有效启用→撤销 -> compared/revoked，两侧证据独立完整', () => {
+      const out = handleCompare(validBody());
+      a.equal(out.httpStatus, 200);
+      a.equal(out.result.status, 'compared');
+      a.equal(out.result.conclusion, 'revoked');
+      a.equal(out.result.conclusionLabel, '已撤销');
+      a.equal(out.result.keyHex, cmpSnap.keyHex);
+      a.equal(out.result.earlier.result.status, 'authorized');
+      a.equal(out.result.earlier.result.value, '01');
+      a.equal(out.result.later.result.status, 'unauthorized');
+      a.equal(out.result.later.result.value, '00');
+      a.ok(out.result.earlier.result.layers.length >= 3, '较早侧应回放多层');
+      a.ok(out.result.later.result.layers.length >= 3, '较晚侧应回放多层');
+      a.notEqual(out.result.earlier.rootHash, out.result.later.rootHash);
+    });
+
+    test('对照页面：双栏区分两侧根摘要/叶值/授权状态，两条可展开路径证据', () => {
+      const out = handleCompare(validBody());
+      const page = out.page;
+      a.match(page, /<title>离线指令授权快照双时点对照结果<\/title>/);
+      a.match(page, /banner-title">已撤销/);
+      a.match(page, /较早快照/);
+      a.match(page, /较晚快照/);
+      a.match(page, new RegExp(cmpSnap.earlier.rootHashHex));
+      a.match(page, new RegExp(cmpSnap.later.rootHashHex));
+      a.match(page, /badge-ok">已授权/);
+      a.match(page, /badge-no">未授权/);
+      a.match(page, /0x01/);
+      a.match(page, /0x00/);
+      a.equal((page.match(/<details class="layers">/g) || []).length, 2, '应有两条可展开路径证据');
+      a.match(page, /逐层路径证据（共 \d+ 层，点击展开）/);
+    });
+
+    test('对照API：归纳 持续授权 / 已启用 / 持续未授权', () => {
+      const still = handleCompare({ earlier: sidePayload(cmpSnap.earlier), later: sidePayload(cmpSnap.earlier) });
+      a.equal(still.result.status, 'compared');
+      a.equal(still.result.conclusion, 'still-authorized');
+      a.match(still.page, /持续授权/);
+
+      const enabled = handleCompare({ earlier: sidePayload(cmpSnap.later), later: sidePayload(cmpSnap.earlier) });
+      a.equal(enabled.result.conclusion, 'enabled');
+      a.equal(enabled.result.conclusionLabel, '已启用');
+      a.match(enabled.page, /banner-title">已启用/);
+
+      const stillNo = handleCompare({ earlier: sidePayload(cmpSnap.later), later: sidePayload(cmpSnap.later) });
+      a.equal(stillNo.result.conclusion, 'still-unauthorized');
+      a.match(stillNo.page, /持续未授权/);
+    });
+
+    test('对照API：较晚侧篡改节点 -> invalid，定位该侧首个失败层，不残留变更结论', () => {
+      const body = validBody();
+      body.later = tamperSide(body.later);
+      const out = handleCompare(body);
+      a.equal(out.result.status, 'invalid');
+      a.equal(out.result.conclusion, null);
+      a.equal(out.result.conclusionLabel, null);
+      a.equal(out.result.code, 'SIDE_INVALID');
+      a.match(out.result.reason, /较晚快照首个失败层：第 2 层（REF_MISMATCH）/);
+      // 较早侧证据保留，但不得据此归纳状态变化
+      a.equal(out.result.earlier.result.status, 'authorized');
+      const page = out.page;
+      a.match(page, /对照无效/);
+      a.match(page, /不得据另一侧/);
+      a.match(page, /第 2 层/);
+      a.equal(page.includes('banner-title">已撤销'), false);
+      a.equal(page.includes('banner-title">已启用'), false);
+      a.equal(page.includes('banner-title">持续授权'), false);
+      // 两侧面板仍各自呈现（较早侧保留已核验证据）
+      a.match(page, /较早快照/);
+      a.match(page, /badge-ok">已授权/);
+      a.match(page, /badge-bad">证明无效/);
+    });
+
+    test('对照API：较早侧非规范 RLP -> invalid，首败层定位到较早侧第 1 层', () => {
+      const body = validBody();
+      const nodes = body.earlier.proofNodes.map((h) => fromHex(h));
+      nodes[0] = noncanonRewrap(nodes[0]); // 同一指令标识下，根节点非规范重封装
+      body.earlier.proofNodes = nodes.map((n) => toHex(n));
+      const out = handleCompare(body);
+      a.equal(out.result.status, 'invalid');
+      a.equal(out.result.code, 'SIDE_INVALID');
+      a.match(out.result.reason, /较早快照首个失败层：第 1 层（RLP_NONCANONICAL）/);
+      a.equal(out.result.later.result.status, 'unauthorized');
+      a.match(out.page, /对照无效/);
+    });
+
+    test('对照API：非规范内嵌叶节点同样被较早侧拒绝', () => {
+      const bad = noncanonNode();
+      const body = validBody();
+      body.earlier = { rootHash: toHex(keccak256(bad)), keyHex: cmpSnap.keyHex, proofNodes: toHex(bad) };
+      const out = handleCompare(body);
+      a.equal(out.result.status, 'invalid');
+      a.equal(out.result.code, 'SIDE_INVALID');
+      a.match(out.result.reason, /较早快照首个失败层：第 1 层（RLP_NONCANONICAL）/);
+    });
+
+    test('对照API：输入标识不一致 -> KEY_MISMATCH，不进入证明核验', () => {
+      const body = validBody();
+      body.later.keyHex = 'a2';
+      const out = handleCompare(body);
+      a.equal(out.result.status, 'invalid');
+      a.equal(out.result.code, 'KEY_MISMATCH');
+      a.match(out.result.reason, /输入标识不一致/);
+      a.equal(out.result.earlier.result, null);
+      a.equal(out.result.later.result, null);
+      a.match(out.page, /对照无效/);
+      a.match(out.page, /输入标识不一致/);
+      a.match(out.page, /第 0 层/);
+    });
+
+    test('对照API：一侧输入无效（根哈希长度错误）-> INPUT_INVALID 第 0 层', () => {
+      const body = validBody();
+      body.earlier.rootHash = '0102';
+      const out = handleCompare(body);
+      a.equal(out.result.status, 'invalid');
+      a.equal(out.result.code, 'INPUT_INVALID');
+      a.match(out.result.reason, /较早快照输入无效/);
+      a.match(out.page, /第 0 层（输入校验阶段）/);
+    });
+
+    test('对照API：缺少 earlier/later 或非对象 -> 400', () => {
+      a.equal(handleCompare({}).httpStatus, 400);
+      a.equal(handleCompare({ earlier: {} }).httpStatus, 400);
+      a.equal(handleCompare('x').httpStatus, 400);
+      a.equal(handleCompare(null).httpStatus, 400);
+    });
+
+    test('对照页面构建：buildComparePage 可直接渲染且转义输入', () => {
+      const out = handleCompare(validBody());
+      const page = buildComparePage(out.result);
+      a.match(page, /双时点对照/);
+      const bad = handleCompare({ earlier: { rootHash: '<script>', keyHex: 'a2', proofNodes: '80' }, later: sidePayload(cmpSnap.later) });
+      a.equal(bad.result.status, 'invalid');
+      a.equal(bad.page.includes('<script>'), false);
+    });
+
+    test('HTTP 冒烟：GET /api/sample/compare 返回双时点示例', async () => {
+      const res = await http('/api/sample/compare');
+      a.equal(res.status, 200);
+      const data = await res.json();
+      a.ok(data.earlier && data.later);
+      a.equal(data.earlier.keyHex, data.later.keyHex);
+      a.equal(data.keyHex, data.earlier.keyHex);
+      a.notEqual(data.earlier.rootHash, data.later.rootHash);
+      a.ok(data.earlier.proofNodes.length > 0 && data.later.proofNodes.length > 0);
+    });
+
+    test('HTTP 冒烟：POST /api/compare 有效启用→撤销对照返回完整变更证据', async () => {
+      const res = await http('/api/compare', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(validBody()),
+      });
+      a.equal(res.status, 200);
+      const data = await res.json();
+      a.equal(data.result.status, 'compared');
+      a.equal(data.result.conclusion, 'revoked');
+      a.match(data.page, /已撤销/);
+      a.equal((data.page.match(/<details class="layers">/g) || []).length, 2);
+    });
+
+    test('HTTP 冒烟：POST /api/compare 一侧篡改只显示无效对照', async () => {
+      const body = validBody();
+      body.earlier = tamperSide(body.earlier);
+      const res = await http('/api/compare', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      a.equal(res.status, 200);
+      const data = await res.json();
+      a.equal(data.result.status, 'invalid');
+      a.match(data.result.reason, /较早快照首个失败层：第 2 层/);
+      a.match(data.page, /对照无效/);
+      a.equal(data.page.includes('banner-title">已撤销'), false);
+    });
+
+    test('入口页：保留原单快照表单并新增双时点对照表单', () => {
+      const html = buildIndexPage();
+      a.match(html, /id="verify-form"/);
+      a.match(html, /id="load-ok"/);
+      a.match(html, /id="load-no"/);
+      a.match(html, /id="compare-form"/);
+      a.match(html, /id="cmp-root-earlier"/);
+      a.match(html, /id="cmp-root-later"/);
+      a.match(html, /id="cmp-key-earlier"/);
+      a.match(html, /id="cmp-key-later"/);
+      a.match(html, /id="load-compare"/);
+      a.match(html, /\/api\/compare/);
+    });
+
+    test('入口页：内联客户端脚本语法有效（模板转义回归）', () => {
+      const script = buildIndexPage().match(/<script>([\s\S]*?)<\/script>/)[1];
+      a.doesNotThrow(() => new Function(script));
+    });
+  });
+
   // ========== 未授权与其余路径/HP/引用失败 ==========
   await suite('未授权（叶值非 01）与其余失败类别').run(async () => {
     test('证明内核：完整抵达叶但值 0x00 -> unauthorized 且保留路径证据', () => {
